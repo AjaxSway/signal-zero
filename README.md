@@ -2,7 +2,7 @@
 
 Agentic terminal intelligence. Your CORTEX, in your shell, with file/shell/git tools and full safety prompts.
 
-> **Status (v0.2.0)**: Agent loop wired and verified end-to-end. Default mode is chat-only; flip `agent on` inside the REPL to enable tool use.
+> **Status (v0.2.1)**: Agent loop wired and verified end-to-end, with the streaming render bug from v0.2.0 fixed. Default mode is chat-only; flip `agent on` inside the REPL to enable tool use.
 
 ---
 
@@ -130,6 +130,24 @@ The CLI never calls model providers directly. Everything flows through your cont
 | `~/.cortex-signal-zero/profile.md` | Per-user, local | Your name, preferences, custom instructions, anything else |
 
 The shipping CLI has zero personal data. The profile.md you write personalizes your experience without ever being part of the codebase.
+
+---
+
+## Changelog
+
+### v0.2.1 — 2026-04-27
+- **Streaming render fix.** v0.2.0 had a subtle bug where text streamed from the model could interleave character-by-character if the user submitted a multi-line input (paste with embedded newlines). Root cause was in the readline `line` event handler: Node's readline emits a `line` event for every queued buffer line and `rl.pause()` does not drain already-queued events, so two `handleCommand()` invocations could fire concurrently and their stdout writes overlap. Fix: serialize handlers through a Promise chain so each line waits for the previous one to fully resolve. The earlier `--quiet` smoke test on v0.2.0 now produces clean output.
+- **Brand alignment.** All on-screen banner strings now read "Agentic Terminal Intelligence" (matches the `package.json` description). Three locations updated.
+- Version bump in `package.json` and the in-binary `VERSION` constant.
+
+### v0.2.0 — 2026-04-27
+- **First agentic release.** Agent loop, 9 tools (file_read/write/list, shell_exec, git_status/diff/add/commit/push), tiered shell-exec safety (allowlist/unknown/danger), diff preview before file writes, typed-confirm gate on force-push to main.
+- Built-in `agent` / `agent on` / `agent off` REPL commands.
+- 8-iteration loop guard per user turn.
+- Phase 1 brand scrub: stripped personal data + vendor names from the shipping system prompt; per-user data lives in `~/.cortex-signal-zero/profile.md`.
+
+### v0.1.0 — 2026-04-27
+- Initial release. Chat REPL with streaming, voice playback, project context auto-attach.
 
 ---
 
