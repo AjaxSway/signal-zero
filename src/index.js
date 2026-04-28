@@ -2,7 +2,7 @@
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  C O R T E X   S I G N A L   Z E R O
-//  AI Terminal Intelligence
+//  Agentic Terminal Intelligence
 //  One Brain. One System. One Solution.
 //  (c) 2026 CORTEXNODE Inc
 // ═══════════════════════════════════════════════════════════════════════════
@@ -26,7 +26,7 @@ const CONFIG_DIR = path.join(HOME, '.cortex-signal-zero');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const HISTORY_FILE = path.join(CONFIG_DIR, 'history.json');
 const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 // CORTEX API — routes through cortexnode.ai (control server proxy)
 const CORTEX_API_URL = process.env.CORTEX_API_URL || 'https://api.cortexnode.ai';
@@ -101,7 +101,7 @@ function renderTitle() {
   console.log(signalGradient('   ====================================================='));
   console.log(signalGradient('   ||') + '                                                 ' + signalGradient('||'));
   console.log(signalGradient('   ||') + c.brandBold('        C O R T E X   S I G N A L   Z E R O      ') + signalGradient('||'));
-  console.log(signalGradient('   ||') + c.dim('              AI Terminal Intelligence                ') + signalGradient('||'));
+  console.log(signalGradient('   ||') + c.dim('           Agentic Terminal Intelligence             ') + signalGradient('||'));
   console.log(signalGradient('   ||') + '                                                 ' + signalGradient('||'));
   console.log(signalGradient('   ====================================================='));
   console.log('');
@@ -110,7 +110,7 @@ function renderTitle() {
 function renderCompactHeader() {
   console.log('');
   console.log(c.brandBold('  CORTEX SIGNAL ZERO') + c.dim(` v${VERSION}`));
-  console.log(c.dim('  AI Terminal Intelligence'));
+  console.log(c.dim('  Agentic Terminal Intelligence'));
   console.log('');
 }
 
@@ -1325,6 +1325,13 @@ async function agentLoop(messages) {
 
     // Soft progress signal so user knows another turn is coming
     console.log(c.dim(`  [agent loop · iter ${iteration} done · ${result.toolUses.length} tool${result.toolUses.length > 1 ? 's' : ''} run]`));
+
+    // Debug trace (env-gated) so we can inspect message structure when troubleshooting
+    if (process.env.CORTEX_DEBUG === '1') {
+      console.log(c.dim('  --- DEBUG: outgoing messages for next turn ---'));
+      console.log(c.dim(JSON.stringify(messages, null, 2).slice(0, 4000)));
+      console.log(c.dim('  --- end debug ---'));
+    }
     console.log('');
   }
 
@@ -1440,15 +1447,23 @@ async function interactiveMode() {
 
   rl.prompt();
 
-  rl.on('line', async (input) => {
-    // Disable prompt during processing
-    rl.pause();
-
-    await handleCommand(input, rl);
-
-    console.log('');
-    rl.resume();
-    rl.prompt();
+  // Serialize line handlers so a fast-typed or pasted multi-line submission
+  // can't fire two concurrent handleCommand() invocations whose streamed
+  // output would interleave on the terminal. Each new line waits for the
+  // previous one to fully resolve before running.
+  let processing = Promise.resolve();
+  rl.on('line', (input) => {
+    processing = processing.then(async () => {
+      rl.pause();
+      try {
+        await handleCommand(input, rl);
+      } catch (e) {
+        console.log(c.error(`  Error: ${e.message}`));
+      }
+      console.log('');
+      rl.resume();
+      rl.prompt();
+    });
   });
 
   rl.on('close', () => {
