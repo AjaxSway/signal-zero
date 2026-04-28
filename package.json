@@ -1,7 +1,7 @@
 {
   "name": "cortex-signal-zero",
-  "version": "0.1.0",
-  "description": "CORTEX SIGNAL ZERO — AI Terminal Intelligence",
+  "version": "0.2.0",
+  "description": "CORTEX SIGNAL ZERO — Agentic Terminal Intelligence",
   "main": "src/index.js",
   "bin": {
     "cortex": "src/index.js",

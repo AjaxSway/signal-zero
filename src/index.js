@@ -26,7 +26,7 @@ const CONFIG_DIR = path.join(HOME, '.cortex-signal-zero');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const HISTORY_FILE = path.join(CONFIG_DIR, 'history.json');
 const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 // CORTEX API — routes through cortexnode.ai (control server proxy)
 const CORTEX_API_URL = process.env.CORTEX_API_URL || 'https://api.cortexnode.ai';
@@ -243,7 +243,15 @@ function getAuthToken() {
   return config.authToken || process.env.CORTEX_AUTH_TOKEN || null;
 }
 
-async function streamResponse(messages) {
+// streamResponse — single API turn. Sends `messages` to the server, paints
+// streamed text deltas, captures any tool_use blocks the model emits, and
+// returns { text, toolUses, stopReason } so the agent loop can decide
+// whether to dispatch tools and re-call.
+//
+// Backward-compatible: callers who don't pass `opts.tools` get the same
+// behavior as before. With tools, the function additionally tracks tool_use
+// content blocks and their accumulated input JSON.
+async function streamResponse(messages, opts = {}) {
   const serverUrl = getServerUrl();
   const authToken = getAuthToken();
   const model = getModel();
@@ -252,19 +260,22 @@ async function streamResponse(messages) {
     throw new Error('Not authenticated. Run: cortex --setup');
   }
 
+  const body = {
+    model,
+    max_tokens: 8192,
+    system: getSystemPromptWithProfile(),
+    messages,
+    stream: true,
+  };
+  if (opts.tools && opts.tools.length) body.tools = opts.tools;
+
   const res = await fetch(`${serverUrl}/v1/chat`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${authToken}`,
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: 8192,
-      system: getSystemPromptWithProfile(),
-      messages,
-      stream: true,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -272,44 +283,96 @@ async function streamResponse(messages) {
     throw new Error(`CORTEX API error ${res.status}: ${err}`);
   }
 
-  // Check if streaming SSE or JSON
   const contentType = res.headers.get('content-type') || '';
 
-  if (contentType.includes('text/event-stream')) {
-    let fullText = '';
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    for await (const chunk of res.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
-
-        try {
-          const event = JSON.parse(data);
-          if (event.type === 'content_block_delta' && event.delta?.text) {
-            process.stdout.write(c.text(event.delta.text));
-            fullText += event.delta.text;
-          }
-        } catch {}
-      }
+  // Non-streaming JSON fallback (server may downgrade)
+  if (!contentType.includes('text/event-stream')) {
+    const data = await res.json();
+    const text = data.content || '';
+    if (text) {
+      process.stdout.write(c.text(text));
+      console.log('');
     }
-
-    console.log('');
-    return fullText;
+    return { text, toolUses: [], stopReason: 'end_turn' };
   }
 
-  // Non-streaming JSON response
-  const data = await res.json();
-  const text = data.content || '';
-  process.stdout.write(c.text(text));
+  // SSE streaming path — handles text deltas + tool_use blocks
+  let fullText = '';
+  const blocks = {}; // index → { type, id?, name?, text?, inputJson? }
+  let stopReason = 'end_turn';
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for await (const chunk of res.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (!data || data === '[DONE]') continue;
+
+      let event;
+      try { event = JSON.parse(data); } catch { continue; }
+
+      // content_block_start: opens a text or tool_use block at index N
+      if (event.type === 'content_block_start') {
+        const i = event.index ?? 0;
+        const cb = event.content_block || {};
+        if (cb.type === 'tool_use') {
+          blocks[i] = { type: 'tool_use', id: cb.id, name: cb.name, inputJson: '' };
+          // Hint to user that a tool call is being prepared
+          process.stdout.write(c.dim(`\n  [tool: ${cb.name}] `));
+        } else if (cb.type === 'text') {
+          blocks[i] = { type: 'text', text: '' };
+        }
+      }
+
+      // content_block_delta: incremental update to a block
+      else if (event.type === 'content_block_delta') {
+        const i = event.index ?? 0;
+        const d = event.delta || {};
+        // Anthropic-native shape: delta.type=text_delta with .text
+        // Server sometimes flattens to delta.text directly — handle both
+        const textChunk = d.text || (d.type === 'text_delta' ? d.text : null);
+        if (textChunk) {
+          process.stdout.write(c.text(textChunk));
+          fullText += textChunk;
+          if (blocks[i] && blocks[i].type === 'text') blocks[i].text += textChunk;
+        }
+        if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+          if (!blocks[i]) blocks[i] = { type: 'tool_use', inputJson: '' };
+          blocks[i].inputJson += d.partial_json;
+        }
+      }
+
+      // content_block_stop: finalize a block (especially parse tool_use input)
+      else if (event.type === 'content_block_stop') {
+        const i = event.index ?? 0;
+        const block = blocks[i];
+        if (block && block.type === 'tool_use' && block.inputJson) {
+          try { block.input = JSON.parse(block.inputJson); }
+          catch { block.input = {}; }
+        }
+      }
+
+      // message_delta: carries stop_reason
+      else if (event.type === 'message_delta') {
+        if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
+      }
+    }
+  }
+
+  // Pull tool_use blocks out in index order
+  const toolUses = Object.keys(blocks)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => blocks[k])
+    .filter((b) => b.type === 'tool_use' && b.id && b.name)
+    .map((b) => ({ id: b.id, name: b.name, input: b.input || {} }));
+
   console.log('');
-  return text;
+  return { text: fullText, toolUses, stopReason };
 }
 
 // ─── File Operations ──────────────────────────────────────────────────────
@@ -373,13 +436,13 @@ function listFiles(dir = '.', recursive = false) {
   }
 }
 
-function runCommand(cmd) {
+function runCommand(cmd, cwd = process.cwd()) {
   try {
     const output = execSync(cmd, {
       encoding: 'utf8',
       timeout: 30000,
       maxBuffer: 1024 * 1024 * 10,
-      cwd: process.cwd(),
+      cwd,
     });
     return { success: true, output: output.trim() };
   } catch (e) {
@@ -389,6 +452,499 @@ function runCommand(cmd) {
       error: e.stderr?.trim() || e.message,
       exitCode: e.status,
     };
+  }
+}
+
+// ─── Agent Tool Schemas ────────────────────────────────────────────────────
+//
+// These are the tool definitions sent to the model on every agentic turn.
+// Format: Anthropic tool-use spec — name, description, input_schema (JSON Schema).
+// The dispatcher (below) maps tool names to local handler functions.
+//
+// Safety model:
+//   - file_read, file_list, git_status, git_diff, git_log → read-only, no confirm
+//   - file_write → diff preview + confirm before write lands
+//   - shell_exec → allowlist runs silently; everything else confirms; danger list
+//     requires typed confirmation
+//   - git_add, git_commit, git_push → confirm; force-push to main blocked
+
+const AGENT_TOOLS = [
+  {
+    name: 'file_read',
+    description:
+      'Read the contents of a file from the local filesystem. Use this when you need to see what is in a file before making decisions. Returns the file contents as text. Files larger than the byte limit are truncated.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute or relative path to the file. ~ is expanded to the user home directory.',
+        },
+        max_bytes: {
+          type: 'number',
+          description: 'Optional limit on bytes to read. Default 50000.',
+        },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'file_write',
+    description:
+      'Write content to a file on the local filesystem. The user will see a diff preview before the write actually happens. Use for creating new files or replacing the entire contents of an existing file. For partial edits, prefer reading the file, computing the new full content, and writing it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute or relative path to the file.',
+        },
+        content: {
+          type: 'string',
+          description: 'The full content to write to the file.',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    name: 'file_list',
+    description:
+      'List files and directories. Use to explore the filesystem before reading specific files. Hides hidden files and node_modules by default.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Directory to list. Defaults to current working directory.',
+        },
+        recursive: {
+          type: 'boolean',
+          description: 'If true, walk the tree recursively. Default false.',
+        },
+      },
+    },
+  },
+  {
+    name: 'shell_exec',
+    description:
+      'Execute a shell command in the user\'s terminal context. Safe read-only commands (ls, pwd, cat, git status, git diff, git log, etc.) run without confirmation. Write or destructive commands prompt the user before running. Truly dangerous commands (rm -rf, sudo, dd, mkfs) require typed confirmation. Returns stdout, stderr, and exit code.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The shell command to execute. Use single-line commands; chain with && or ; if needed.',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Optional working directory for the command. Defaults to the user\'s current cwd.',
+        },
+      },
+      required: ['command'],
+    },
+  },
+  {
+    name: 'git_status',
+    description:
+      'Show the git status of a repository. Use to see modified, staged, and untracked files before deciding what to commit.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'Optional working directory. Defaults to current cwd.' },
+      },
+    },
+  },
+  {
+    name: 'git_diff',
+    description:
+      'Show git diff. By default shows unstaged changes. Set staged=true to see what would be committed. Optionally limit to a specific path.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'Optional working directory.' },
+        staged: { type: 'boolean', description: 'Show staged diff instead of unstaged. Default false.' },
+        path: { type: 'string', description: 'Optional path to limit the diff to a specific file or directory.' },
+      },
+    },
+  },
+  {
+    name: 'git_add',
+    description:
+      'Stage files for the next commit. Pass either a list of paths or ["."] to stage everything.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of paths to stage. Use ["."] for all changes in the current directory.',
+        },
+        cwd: { type: 'string', description: 'Optional working directory.' },
+      },
+      required: ['paths'],
+    },
+  },
+  {
+    name: 'git_commit',
+    description:
+      'Create a commit with the staged changes. Always show the user the message before committing. Always prompts for confirmation. Use clear, conventional commit messages.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          description: 'The commit message. Single subject line, optionally followed by a blank line and longer body.',
+        },
+        cwd: { type: 'string', description: 'Optional working directory.' },
+      },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'git_push',
+    description:
+      'Push commits to the remote repository. Always prompts for confirmation. Refuses force-push to main without typed-out confirmation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'Optional working directory.' },
+        force: { type: 'boolean', description: 'Use git push --force. Requires extra confirmation. Default false.' },
+        remote: { type: 'string', description: 'Remote name. Default "origin".' },
+        branch: { type: 'string', description: 'Branch to push. Defaults to current branch.' },
+      },
+    },
+  },
+];
+
+// ─── Safety: diff preview + confirmation prompts ─────────────────────────
+
+// Shell allowlist — read-only commands that run without prompting
+const SHELL_ALLOWLIST = [
+  /^ls(\s|$)/, /^pwd$/, /^whoami$/, /^date$/, /^uname/, /^echo\s/,
+  /^cat\s/, /^head\s/, /^tail\s/, /^wc\s/, /^file\s/,
+  /^grep\s/, /^rg\s/, /^find\s/,
+  /^git\s+(status|diff|log|branch|show|remote|config\s+--get|rev-parse)/,
+  /^which\s/, /^type\s/, /^env$/, /^printenv$/,
+  /^node\s+--version$/, /^npm\s+--version$/, /^npm\s+list/, /^npm\s+ls/,
+];
+
+// Hard danger list — commands that require typed confirmation (not just y)
+const SHELL_DANGER_PATTERNS = [
+  /\brm\s+-[a-z]*r[a-z]*f/, /\brm\s+-[a-z]*f[a-z]*r/, /\brm\s+--recursive/,
+  /\bsudo\b/, /\bdoas\b/,
+  /\bdd\s/, /\bmkfs/, /\bfdisk/, /\bparted/,
+  /:\s*\(\)\s*\{\s*:\|/, // fork bomb
+  />\s*\/dev\/sd[a-z]/, />\s*\/dev\/nvme/, />\s*\/dev\/disk/,
+  /\bformat\s+[a-zA-Z]:/i,
+  /\bgit\s+push\s+.*--force(-with-lease)?\s+.*main/,
+  /\bgit\s+reset\s+--hard\s+(origin\/)?main/,
+];
+
+function isAllowlistedShell(cmd) {
+  return SHELL_ALLOWLIST.some((re) => re.test(cmd.trim()));
+}
+
+function isDangerousShell(cmd) {
+  return SHELL_DANGER_PATTERNS.some((re) => re.test(cmd));
+}
+
+// promptUser — fire a question + read a line. Reuses an existing readline
+// if one is provided (interactive mode); otherwise creates a one-shot.
+async function promptUser(question, expected = null) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      const a = (answer || '').trim();
+      if (expected) resolve(a === expected);
+      else resolve(a);
+    });
+  });
+}
+
+async function confirmYesNo(question, dangerLabel = false) {
+  const tag = dangerLabel ? c.error('  [DANGER] ') : c.warning('  [confirm] ');
+  const prompt = tag + question + c.dim(' [y/N]: ');
+  const ans = await promptUser(prompt);
+  return /^y(es)?$/i.test(ans);
+}
+
+async function confirmTyped(question, expected) {
+  const prompt = c.error('  [DANGER] ') + question + c.dim(`\n  Type "${expected}" to confirm: `);
+  return await promptUser(prompt, expected);
+}
+
+// renderUnifiedDiff — produce a colorized minimal unified diff between two
+// strings. Not a full diff algorithm — line-level, good enough for review.
+function renderUnifiedDiff(beforeText, afterText, label = 'file') {
+  const before = (beforeText || '').split('\n');
+  const after = (afterText || '').split('\n');
+  const out = [];
+  out.push(c.dim('  --- ' + label + ' (before)'));
+  out.push(c.dim('  +++ ' + label + ' (after)'));
+  const max = Math.max(before.length, after.length);
+  let added = 0, removed = 0, unchanged = 0;
+  for (let i = 0; i < max; i++) {
+    const b = before[i];
+    const a = after[i];
+    if (b === a) {
+      unchanged++;
+      // Show 1 line of context around changes; skip otherwise
+      const nextChange = (j) => before[j] !== after[j] && (before[j] !== undefined || after[j] !== undefined);
+      const nearChange = nextChange(i - 1) || nextChange(i + 1);
+      if (nearChange && b !== undefined) out.push(c.text('   ' + b));
+    } else {
+      if (b !== undefined) { out.push(c.error('  - ' + b)); removed++; }
+      if (a !== undefined) { out.push(c.success('  + ' + a)); added++; }
+    }
+  }
+  out.push(c.dim(`  [${added} added, ${removed} removed, ${unchanged} unchanged]`));
+  return out.join('\n');
+}
+
+// ─── Tool Dispatcher ──────────────────────────────────────────────────────
+//
+// Takes a tool_use block from the model and routes it to the matching local
+// handler. Returns a structured tool_result that the API consumes verbatim.
+
+function expandPath(p) {
+  if (!p) return p;
+  if (p.startsWith('~')) return path.join(HOME, p.slice(1));
+  return p;
+}
+
+function toolResult(toolUseId, content, isError = false) {
+  return {
+    type: 'tool_result',
+    tool_use_id: toolUseId,
+    content: typeof content === 'string' ? content : JSON.stringify(content, null, 2),
+    ...(isError ? { is_error: true } : {}),
+  };
+}
+
+const TOOL_HANDLERS = {
+  file_read: ({ path: p, max_bytes }) => {
+    const abs = expandPath(p);
+    const resolved = path.resolve(abs);
+    if (!existsSync(resolved)) return { ok: false, error: `File not found: ${p}` };
+    try {
+      const stats = statSync(resolved);
+      if (stats.isDirectory()) return { ok: false, error: `Path is a directory, not a file: ${p}` };
+      const limit = Math.max(1, Math.min(max_bytes || 50000, 500000));
+      const buf = readFileSync(resolved);
+      const truncated = buf.length > limit;
+      const content = buf.slice(0, limit).toString('utf8');
+      return {
+        ok: true,
+        path: resolved,
+        bytes: buf.length,
+        truncated,
+        content: truncated ? content + `\n\n[truncated at ${limit} of ${buf.length} bytes]` : content,
+      };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  },
+
+  file_write: async ({ path: p, content }) => {
+    if (!p) return { ok: false, error: 'path required' };
+    if (typeof content !== 'string') return { ok: false, error: 'content must be a string' };
+    const abs = expandPath(p);
+    const resolved = path.resolve(abs);
+    const exists = existsSync(resolved);
+    const before = exists ? readFileSync(resolved, 'utf8') : '';
+
+    // Show diff before writing
+    console.log('');
+    console.log(c.brand('  ┌─ Proposed change'));
+    console.log(c.brand('  │ ') + c.accent(resolved));
+    console.log(c.brand('  │ ') + (exists ? c.dim('replacing existing file') : c.success('creating new file')));
+    console.log(c.brand('  │'));
+    if (exists) {
+      console.log(renderUnifiedDiff(before, content, path.basename(resolved)));
+    } else {
+      console.log(c.dim('  --- (new file)'));
+      content.split('\n').slice(0, 30).forEach((line) => console.log(c.success('  + ' + line)));
+      if (content.split('\n').length > 30) console.log(c.dim(`  + ... (${content.split('\n').length - 30} more lines)`));
+    }
+    console.log('');
+
+    const ok = await confirmYesNo(`Apply write to ${path.basename(resolved)}?`);
+    if (!ok) return { ok: false, error: 'User declined write' };
+
+    const result = writeFile(abs, content);
+    if (result === true) {
+      console.log(c.success(`  ✓ wrote ${Buffer.byteLength(content, 'utf8')} bytes to ${resolved}`));
+      return { ok: true, path: resolved, bytes: Buffer.byteLength(content, 'utf8') };
+    }
+    return { ok: false, error: typeof result === 'string' ? result : 'Unknown write error' };
+  },
+
+  file_list: ({ path: p, recursive }) => {
+    const target = p ? expandPath(p) : '.';
+    try {
+      const files = listFiles(target, !!recursive);
+      return { ok: true, path: path.resolve(target), count: files.length, files };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  },
+
+  shell_exec: async ({ command, cwd }) => {
+    if (!command || !command.trim()) return { ok: false, error: 'command required' };
+    const workDir = cwd ? expandPath(cwd) : process.cwd();
+
+    // Tier the command: allowlist (silent) → dangerous (typed confirm) → unknown (y/n)
+    if (isDangerousShell(command)) {
+      console.log('');
+      console.log(c.error('  ⚠ This command is on the danger list:'));
+      console.log(c.text(`    $ ${command}`));
+      console.log(c.dim(`    cwd: ${workDir}`));
+      const ok = await confirmTyped(
+        `Type "RUN IT" exactly to proceed. Anything else cancels.`,
+        'RUN IT',
+      );
+      if (!ok) return { ok: false, error: 'User declined dangerous command' };
+    } else if (!isAllowlistedShell(command)) {
+      console.log('');
+      console.log(c.warning(`  Command requires confirmation:`));
+      console.log(c.text(`    $ ${command}`));
+      console.log(c.dim(`    cwd: ${workDir}`));
+      const ok = await confirmYesNo('Run it?');
+      if (!ok) return { ok: false, error: 'User declined command' };
+    } else {
+      // Allowlisted — run silently with a one-line dim trace
+      console.log(c.dim(`  $ ${command}`));
+    }
+
+    const result = runCommand(command, workDir);
+    return {
+      ok: result.success,
+      command,
+      cwd: workDir,
+      stdout: result.output || '',
+      stderr: result.error || '',
+      exit_code: result.exitCode ?? (result.success ? 0 : 1),
+    };
+  },
+
+  git_status: ({ cwd }) => {
+    const workDir = cwd ? expandPath(cwd) : process.cwd();
+    const result = runCommand('git status --porcelain=v1 --branch', workDir);
+    return {
+      ok: result.success,
+      cwd: workDir,
+      output: result.output || result.error || '',
+    };
+  },
+
+  git_diff: ({ cwd, staged, path: p }) => {
+    const workDir = cwd ? expandPath(cwd) : process.cwd();
+    const flags = staged ? '--staged' : '';
+    const target = p ? `-- ${JSON.stringify(p)}` : '';
+    const result = runCommand(`git diff ${flags} ${target}`.trim(), workDir);
+    return {
+      ok: result.success,
+      cwd: workDir,
+      staged: !!staged,
+      output: result.output || result.error || '',
+    };
+  },
+
+  git_add: ({ paths, cwd }) => {
+    const workDir = cwd ? expandPath(cwd) : process.cwd();
+    const safePaths = (paths || []).map((p) => JSON.stringify(p)).join(' ');
+    if (!safePaths) return { ok: false, error: 'paths array required' };
+    const result = runCommand(`git add ${safePaths}`, workDir);
+    return {
+      ok: result.success,
+      cwd: workDir,
+      paths,
+      output: result.output || result.error || '',
+    };
+  },
+
+  git_commit: async ({ message, cwd }) => {
+    const workDir = cwd ? expandPath(cwd) : process.cwd();
+    if (!message || !message.trim()) return { ok: false, error: 'commit message required' };
+
+    console.log('');
+    console.log(c.brand('  ┌─ Proposed commit'));
+    console.log(c.brand('  │ ') + c.dim(`cwd: ${workDir}`));
+    console.log(c.brand('  │'));
+    message.split('\n').forEach((line) => console.log(c.brand('  │ ') + c.text(line)));
+    console.log('');
+
+    const ok = await confirmYesNo('Create this commit?');
+    if (!ok) return { ok: false, error: 'User declined commit' };
+
+    try {
+      execSync(`git commit -F -`, {
+        cwd: workDir,
+        input: message,
+        encoding: 'utf8',
+        timeout: 30000,
+      });
+      const head = runCommand('git log -1 --oneline', workDir);
+      console.log(c.success(`  ✓ ${head.output || 'committed'}`));
+      return { ok: true, cwd: workDir, head: head.output || '' };
+    } catch (e) {
+      return { ok: false, error: (e.stderr || e.stdout || e.message || '').trim() };
+    }
+  },
+
+  git_push: async ({ cwd, force, remote, branch }) => {
+    const workDir = cwd ? expandPath(cwd) : process.cwd();
+    const r = remote || 'origin';
+    const b = branch || (runCommand('git branch --show-current', workDir).output || '<current>');
+    const f = force ? ' --force' : '';
+
+    // Block force-push to main without typed confirm
+    if (force && (b === 'main' || b === 'master')) {
+      console.log('');
+      console.log(c.error(`  ⚠ Force-pushing to ${b} can destroy upstream history.`));
+      const ok = await confirmTyped(
+        `Type "FORCE PUSH ${b.toUpperCase()}" exactly to proceed.`,
+        `FORCE PUSH ${b.toUpperCase()}`,
+      );
+      if (!ok) return { ok: false, error: 'User declined force-push to protected branch' };
+    } else {
+      console.log('');
+      console.log(c.warning(`  About to push:`));
+      console.log(c.text(`    git push ${r} ${b}${f}`));
+      console.log(c.dim(`    cwd: ${workDir}`));
+      const ok = await confirmYesNo('Push?');
+      if (!ok) return { ok: false, error: 'User declined push' };
+    }
+
+    const branchArg = branch ? ` ${JSON.stringify(branch)}` : '';
+    const result = runCommand(`git push ${r}${branchArg}${f}`, workDir);
+    return {
+      ok: result.success,
+      cwd: workDir,
+      remote: r,
+      branch: b,
+      forced: !!force,
+      output: result.output || result.error || '',
+    };
+  },
+};
+
+async function dispatchTool(toolUseBlock) {
+  const { id, name, input } = toolUseBlock || {};
+  if (!name || !TOOL_HANDLERS[name]) {
+    return toolResult(id, `Unknown tool: ${name}`, true);
+  }
+  try {
+    const handler = TOOL_HANDLERS[name];
+    const result = await Promise.resolve(handler(input || {}));
+    if (result && result.ok === false) {
+      return toolResult(id, `Tool ${name} failed: ${result.error || 'unknown error'}`, true);
+    }
+    return toolResult(id, result);
+  } catch (e) {
+    return toolResult(id, `Tool ${name} threw: ${e.message}`, true);
   }
 }
 
@@ -684,11 +1240,97 @@ async function handleCommand(input, rl) {
     return;
   }
 
+  if (cmd === 'agent' || cmd === 'agent status') {
+    const on = isAgentModeOn();
+    console.log(c.accent(`  Agent mode: ${on ? c.success('ON') : c.warning('OFF')}`));
+    if (on) {
+      console.log(c.dim('  CORTEX can read/write files, run shell, use git.'));
+      console.log(c.dim('  Writes and destructive operations always prompt for confirmation.'));
+    } else {
+      console.log(c.dim('  Chat-only. Run "agent on" to enable tool use.'));
+    }
+    return;
+  }
+
+  if (cmd === 'agent on') {
+    const config = loadConfig();
+    config.agentMode = true;
+    saveConfig(config);
+    console.log(c.success('  Agent mode enabled.'));
+    console.log(c.dim('  CORTEX can now read/write files, run shell, and use git.'));
+    console.log(c.dim('  Writes and destructive operations always prompt before running.'));
+    return;
+  }
+
+  if (cmd === 'agent off') {
+    const config = loadConfig();
+    config.agentMode = false;
+    saveConfig(config);
+    console.log(c.warning('  Agent mode disabled. Chat-only.'));
+    return;
+  }
+
   // Everything else goes to the AI
   await chat(trimmed);
 }
 
 // ─── Chat with AI ─────────────────────────────────────────────────────────
+
+const MAX_AGENT_LOOP_ITERATIONS = 8;
+
+function isAgentModeOn() {
+  const config = loadConfig();
+  return config.agentMode === true || process.env.CORTEX_AGENT === '1';
+}
+
+// agentLoop — runs the model in agent mode. Sends messages with tools,
+// dispatches any tool_use blocks the model returns, appends tool_results,
+// and loops until the model stops requesting tools (or we hit the cap).
+//
+// Returns the final assistant text for voice playback / history.
+async function agentLoop(messages) {
+  let iteration = 0;
+  let finalText = '';
+
+  while (iteration < MAX_AGENT_LOOP_ITERATIONS) {
+    iteration++;
+
+    const result = await streamResponse(messages, { tools: AGENT_TOOLS });
+    if (result.text) finalText = result.text;
+
+    // No tools requested? We're done.
+    if (!result.toolUses || result.toolUses.length === 0) {
+      return finalText;
+    }
+
+    // The assistant message must include both text (if any) and tool_use blocks
+    // for Anthropic to accept the subsequent tool_result message.
+    const assistantContent = [];
+    if (result.text) assistantContent.push({ type: 'text', text: result.text });
+    for (const tu of result.toolUses) {
+      assistantContent.push({ type: 'tool_use', id: tu.id, name: tu.name, input: tu.input });
+    }
+    messages.push({ role: 'assistant', content: assistantContent });
+
+    // Execute each tool_use, gather tool_result blocks
+    const toolResults = [];
+    for (const tu of result.toolUses) {
+      console.log(c.dim(`  > executing ${tu.name}...`));
+      const tr = await dispatchTool(tu);
+      toolResults.push(tr);
+    }
+
+    // Send tool_results back as a new user message and let the model continue
+    messages.push({ role: 'user', content: toolResults });
+
+    // Soft progress signal so user knows another turn is coming
+    console.log(c.dim(`  [agent loop · iter ${iteration} done · ${result.toolUses.length} tool${result.toolUses.length > 1 ? 's' : ''} run]`));
+    console.log('');
+  }
+
+  console.log(c.warning(`  [agent loop hit max iterations (${MAX_AGENT_LOOP_ITERATIONS}) — stopping]`));
+  return finalText;
+}
 
 async function chat(input) {
   // Build user message with file context if referencing files
@@ -720,15 +1362,23 @@ async function chat(input) {
   console.log('');
 
   try {
-    const response = await streamResponse(conversationMessages);
-    addMessage('assistant', response);
+    let finalText;
+    if (isAgentModeOn()) {
+      finalText = await agentLoop(conversationMessages);
+    } else {
+      const result = await streamResponse(conversationMessages);
+      finalText = result.text;
+      // Persist a clean assistant message in non-agent mode
+      addMessage('assistant', finalText);
+    }
     console.log('');
-    // Speak the response (non-blocking)
-    speakResponse(response);
+    // Speak the final response (non-blocking)
+    if (finalText) speakResponse(finalText);
   } catch (e) {
     console.log(c.error(`  Error: ${e.message}`));
     console.log('');
-    // Remove failed message
+    // Roll back the user message we just added so the conversation history
+    // doesn't end on an unanswered turn.
     conversationMessages.pop();
   }
 }
@@ -736,6 +1386,7 @@ async function chat(input) {
 // ─── Help ─────────────────────────────────────────────────────────────────
 
 function showHelp() {
+  const agentOn = isAgentModeOn();
   console.log('');
   console.log(c.brand('  +---------------------------------------------+'));
   console.log(c.brand('  |') + c.brandBold('  COMMANDS                                    ') + c.brand('|'));
@@ -748,21 +1399,29 @@ function showHelp() {
   console.log(c.brand('  |') + `  ${c.accent('reset')}           Clear conversation`);
   console.log(c.brand('  |') + `  ${c.accent('context')}         Show project context`);
   console.log(c.brand('  |'));
-  console.log(c.brand('  |') + c.dim('  File Operations'));
+  console.log(c.brand('  |') + c.dim('  Local file commands (you, not the agent)'));
   console.log(c.brand('  |') + `  ${c.accent('ls [dir]')}        List files`);
   console.log(c.brand('  |') + `  ${c.accent('tree')}            Project file tree`);
   console.log(c.brand('  |') + `  ${c.accent('cat <file>')}      Read a file`);
   console.log(c.brand('  |'));
-  console.log(c.brand('  |') + c.dim('  Shell'));
+  console.log(c.brand('  |') + c.dim('  Shell (you, not the agent)'));
   console.log(c.brand('  |') + `  ${c.accent('run <cmd>')}       Execute shell command`);
   console.log(c.brand('  |') + `  ${c.accent('! <cmd>')}         Execute shell command`);
   console.log(c.brand('  |'));
+  console.log(c.brand('  |') + c.dim('  Agent mode'));
+  console.log(c.brand('  |') + `  ${c.accent('agent')}           Show agent mode status`);
+  console.log(c.brand('  |') + `  ${c.accent('agent on')}        Enable agent mode (CORTEX uses tools)`);
+  console.log(c.brand('  |') + `  ${c.accent('agent off')}       Disable agent mode (chat only)`);
+  console.log(c.brand('  |') + `  Currently: ${agentOn ? c.success('ON') : c.warning('OFF')}`);
+  console.log(c.brand('  |'));
   console.log(c.brand('  |') + c.dim('  Interface'));
-  console.log(c.brand('  |') + `  ${c.accent('logo')}            Show Signal Zero logo`);
+  console.log(c.brand('  |') + `  ${c.accent('logo')}            Show CORTEX logo`);
   console.log(c.brand('  |') + `  ${c.accent('clear')}           Clear screen`);
   console.log(c.brand('  |') + `  ${c.accent('exit')}            Sign off`);
   console.log(c.brand('  |'));
   console.log(c.brand('  |') + c.dim('  Anything else is sent to CORTEX.'));
+  console.log(c.brand('  |') + c.dim('  In agent mode, CORTEX can read/write files, run shell, use git'));
+  console.log(c.brand('  |') + c.dim('  Writes and destructive ops always confirm before running.'));
   console.log(c.brand('  |'));
   console.log(c.brand('  +---------------------------------------------+'));
 }
