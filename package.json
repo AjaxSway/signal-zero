@@ -1,0 +1,29 @@
+{
+  "name": "cortex-signal-zero",
+  "version": "0.1.0",
+  "description": "CORTEX SIGNAL ZERO — AI Terminal Intelligence",
+  "main": "src/index.js",
+  "bin": {
+    "cortex": "src/index.js",
+    "signal-zero": "src/index.js",
+    "csz": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js --dev"
+  },
+  "keywords": ["cortex", "signal-zero", "cli", "ai", "intelligence", "terminal", "assistant"],
+  "author": "CORTEXNODE Inc",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "ora": "^7.0.1",
+    "boxen": "^7.1.1",
+    "gradient-string": "^2.0.2",
+    "figlet": "^1.7.0"
+  }
+}
