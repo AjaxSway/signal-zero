@@ -50,10 +50,61 @@ const c = {
   warning: chalk.hex('#ECC94B'),
   error: chalk.hex('#FC8181'),
   muted: chalk.hex('#718096'),
+  you: chalk.hex('#F6AD55').bold,      // Sir's input — warm amber
+  youLabel: chalk.hex('#F6AD55'),      // "YOU" prefix label
+  youText: chalk.hex('#FFE0B2'),       // Sir's echoed message text
 };
 
 const signalGradient = gradient(['#00E5FF', '#66F0FF', '#00E5FF']);
 const coreGradient = gradient(['#00E5FF', '#0088AA', '#004455']);
+
+// ─── Word-aware streaming renderer ────────────────────────────────────────
+// Buffers the current word and wraps at terminal width so long responses
+// never break mid-word. Resets per-response via resetStreamRenderer().
+
+const STREAM_INDENT = '  ';
+let _streamCol = STREAM_INDENT.length;
+let _wordBuf = '';
+
+function resetStreamRenderer() {
+  _streamCol = STREAM_INDENT.length;
+  _wordBuf = '';
+}
+
+function _flushWordBuf(forceNewline = false) {
+  if (_wordBuf) {
+    const wrapAt = Math.max(40, Math.min((process.stdout.columns || 100) - 4, 110));
+    if (_streamCol + _wordBuf.length > wrapAt) {
+      process.stdout.write('\n' + STREAM_INDENT);
+      _streamCol = STREAM_INDENT.length;
+    }
+    process.stdout.write(c.text(_wordBuf));
+    _streamCol += _wordBuf.length;
+    _wordBuf = '';
+  }
+  if (forceNewline) {
+    process.stdout.write('\n' + STREAM_INDENT);
+    _streamCol = STREAM_INDENT.length;
+  }
+}
+
+function streamChar(ch) {
+  if (ch === '\n') {
+    _flushWordBuf(true);
+  } else if (ch === ' ' || ch === '\t') {
+    _flushWordBuf();
+    if (_streamCol > STREAM_INDENT.length) {
+      process.stdout.write(c.text(' '));
+      _streamCol += 1;
+    }
+  } else {
+    _wordBuf += ch;
+  }
+}
+
+function streamText(chunk) {
+  for (const ch of chunk) streamChar(ch);
+}
 
 // ─── Config Management ────────────────────────────────────────────────────
 
@@ -290,13 +341,16 @@ async function streamResponse(messages, opts = {}) {
     const data = await res.json();
     const text = data.content || '';
     if (text) {
-      process.stdout.write(c.text(text));
+      resetStreamRenderer();
+      streamText(text);
+      _flushWordBuf();
       console.log('');
     }
     return { text, toolUses: [], stopReason: 'end_turn' };
   }
 
   // SSE streaming path — handles text deltas + tool_use blocks
+  resetStreamRenderer();
   let fullText = '';
   const blocks = {}; // index → { type, id?, name?, text?, inputJson? }
   let stopReason = 'end_turn';
@@ -337,7 +391,7 @@ async function streamResponse(messages, opts = {}) {
         // Server sometimes flattens to delta.text directly — handle both
         const textChunk = d.text || (d.type === 'text_delta' ? d.text : null);
         if (textChunk) {
-          process.stdout.write(c.text(textChunk));
+          streamText(textChunk);
           fullText += textChunk;
           if (blocks[i] && blocks[i].type === 'text') blocks[i].text += textChunk;
         }
@@ -732,6 +786,58 @@ const TOOL_HANDLERS = {
       const stats = statSync(resolved);
       if (stats.isDirectory()) return { ok: false, error: `Path is a directory, not a file: ${p}` };
       const limit = Math.max(1, Math.min(max_bytes || 50000, 500000));
+      const ext = path.extname(resolved).toLowerCase();
+
+      // PDF extraction — readFileSync('utf8') returns garbage on binary PDFs.
+      // Shell out to pdftotext (poppler) for layout-preserved text. Sir surfaced
+      // 2026-04-30 that CORTEX kept saying "technical issue with path processing"
+      // when handed PDFs — the path was fine, the binary was the issue.
+      if (ext === '.pdf') {
+        try {
+          const text = execSync(`pdftotext -layout -enc UTF-8 ${JSON.stringify(resolved)} -`, {
+            encoding: 'utf8',
+            maxBuffer: 10 * 1024 * 1024,
+          });
+          const truncated = text.length > limit;
+          const content = text.slice(0, limit);
+          return {
+            ok: true,
+            path: resolved,
+            bytes: stats.size,
+            extracted_chars: text.length,
+            file_type: 'pdf',
+            truncated,
+            content: truncated ? content + `\n\n[truncated at ${limit} of ${text.length} extracted chars]` : content,
+          };
+        } catch (pdfErr) {
+          return {
+            ok: false,
+            error: `PDF extraction failed: ${pdfErr.message}. Confirm pdftotext is installed (brew install poppler).`,
+          };
+        }
+      }
+
+      // Binary detection — refuse known-binary extensions with a clear message
+      // instead of returning UTF-8 garbage that the LLM will mistake for content.
+      const BINARY_EXTS = new Set([
+        '.docx', '.xlsx', '.pptx', '.doc', '.xls', '.ppt',
+        '.png', '.jpg', '.jpeg', '.gif', '.heic', '.webp', '.tiff', '.bmp', '.ico', '.svg',
+        '.mp3', '.m4a', '.wav', '.aac', '.ogg', '.flac',
+        '.mp4', '.mov', '.avi', '.mkv', '.webm',
+        '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar',
+        '.dmg', '.pkg', '.app', '.ipa', '.apk',
+        '.psd', '.ai', '.sketch', '.fig',
+        '.dylib', '.so', '.exe', '.bin'
+      ]);
+      if (BINARY_EXTS.has(ext)) {
+        return {
+          ok: false,
+          file_type: ext.slice(1),
+          error: `Binary file (${ext}) — file_read returns text only. For ${ext.slice(1)} content, use a format-specific extractor or convert to text first.`,
+        };
+      }
+
+      // Default text path
       const buf = readFileSync(resolved);
       const truncated = buf.length > limit;
       const content = buf.slice(0, limit).toString('utf8');
@@ -1364,9 +1470,12 @@ async function chat(input) {
 
   addMessage('user', userContent);
 
+  // Echo Sir's input in warm amber so it's visually distinct from CORTEX's response
   console.log('');
-  console.log(c.brand('  CORTEX') + c.dim(' >'));
+  console.log(c.youLabel('  YOU') + c.dim(' › ') + c.youText(input));
   console.log('');
+  console.log(c.brand('  CORTEX') + c.dim(' ›'));
+  console.log(STREAM_INDENT);
 
   try {
     let finalText;
@@ -1375,6 +1484,7 @@ async function chat(input) {
     } else {
       const result = await streamResponse(conversationMessages);
       finalText = result.text;
+      _flushWordBuf(); // flush any trailing word not yet written
       // Persist a clean assistant message in non-agent mode
       addMessage('assistant', finalText);
     }
@@ -1439,7 +1549,7 @@ async function interactiveMode() {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: c.brand('  * ') + c.accent('CORTEX') + c.brand(' > '),
+    prompt: c.youLabel('  YOU') + c.dim(' › '),
   });
 
   console.log(c.dim('  Type a command or question. "help" for commands. "exit" to quit.'));
@@ -1475,8 +1585,78 @@ async function interactiveMode() {
 
 // ─── CLI Entry ────────────────────────────────────────────────────────────
 
+// CORTEX CORE — single execution path. Routes to local cortex-control-server's
+// /core/execute endpoint. All terminal commands flow through here for unified
+// memory, state, logging, and brain routing.
+//
+// Usage:  cortex execute "<input>"
+//         cortex execute --json "<input>"   (JSON output mode)
+async function coreExecute(input, opts = {}) {
+  const authToken = getAuthToken();
+  if (!authToken) {
+    console.log(c.error('  Not authenticated. Run: cortex --setup'));
+    process.exit(1);
+  }
+  const serverUrl = getServerUrl() || 'http://127.0.0.1:7749';
+  const target = `${serverUrl.replace(/\/+$/, '')}/core/execute`;
+  try {
+    const res = await fetch(target, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({
+        input,
+        source: 'terminal',
+        user: 'george',
+        context: { cwd: process.cwd() },
+      }),
+    });
+    const data = await res.json();
+    if (opts.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return data;
+    }
+    if (!data.success) {
+      console.log(c.error(`  CORE error: ${data.error || res.status}`));
+      // Backward-compat fallback: if CORE is down, run via legacy chat path.
+      console.log(c.dim('  Falling back to legacy chat path...'));
+      await chat(input);
+      return null;
+    }
+    // Human output mode
+    console.log('');
+    console.log(c.brand('  CORTEX') + c.dim(' > ') + c.text(data.output));
+    console.log('');
+    if (data.meta) {
+      console.log(c.dim(`  brain: ${data.meta.brain_source} · ${data.meta.duration_ms}ms · exec_count: ${data.state?.exec_count ?? '?'}`));
+      console.log('');
+    }
+    return data;
+  } catch (e) {
+    console.log(c.error(`  CORE unreachable: ${e.message}`));
+    console.log(c.dim('  Falling back to legacy chat path...'));
+    await chat(input);
+    return null;
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
+
+  // CORTEX CORE — `cortex execute "<input>"` routes through /core/execute
+  if (args[0] === 'execute' || args[0] === 'exec') {
+    const jsonMode = args.includes('--json');
+    const input = args.slice(1).filter(a => a !== '--json').join(' ').trim();
+    if (!input) {
+      console.log(c.error('  Usage: cortex execute "<input>" [--json]'));
+      process.exit(1);
+    }
+    if (!jsonMode) renderCompactHeader();
+    await coreExecute(input, { json: jsonMode });
+    process.exit(0);
+  }
 
   // Setup mode
   if (args.includes('--setup') || args.includes('setup')) {
