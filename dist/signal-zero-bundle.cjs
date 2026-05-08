@@ -8681,10 +8681,55 @@ var c = {
   success: source_default.hex("#48BB78"),
   warning: source_default.hex("#ECC94B"),
   error: source_default.hex("#FC8181"),
-  muted: source_default.hex("#718096")
+  muted: source_default.hex("#718096"),
+  you: source_default.hex("#F6AD55").bold,
+  // Sir's input — warm amber
+  youLabel: source_default.hex("#F6AD55"),
+  // "YOU" prefix label
+  youText: source_default.hex("#FFE0B2")
+  // Sir's echoed message text
 };
 var signalGradient = (0, import_gradient_string.default)(["#00E5FF", "#66F0FF", "#00E5FF"]);
 var coreGradient = (0, import_gradient_string.default)(["#00E5FF", "#0088AA", "#004455"]);
+var STREAM_INDENT = "  ";
+var _streamCol = STREAM_INDENT.length;
+var _wordBuf = "";
+function resetStreamRenderer() {
+  _streamCol = STREAM_INDENT.length;
+  _wordBuf = "";
+}
+function _flushWordBuf(forceNewline = false) {
+  if (_wordBuf) {
+    const wrapAt = Math.max(40, Math.min((process.stdout.columns || 100) - 4, 110));
+    if (_streamCol + _wordBuf.length > wrapAt) {
+      process.stdout.write("\n" + STREAM_INDENT);
+      _streamCol = STREAM_INDENT.length;
+    }
+    process.stdout.write(c.text(_wordBuf));
+    _streamCol += _wordBuf.length;
+    _wordBuf = "";
+  }
+  if (forceNewline) {
+    process.stdout.write("\n" + STREAM_INDENT);
+    _streamCol = STREAM_INDENT.length;
+  }
+}
+function streamChar(ch) {
+  if (ch === "\n") {
+    _flushWordBuf(true);
+  } else if (ch === " " || ch === "	") {
+    _flushWordBuf();
+    if (_streamCol > STREAM_INDENT.length) {
+      process.stdout.write(c.text(" "));
+      _streamCol += 1;
+    }
+  } else {
+    _wordBuf += ch;
+  }
+}
+function streamText(chunk) {
+  for (const ch of chunk) streamChar(ch);
+}
 function loadConfig() {
   try {
     if ((0, import_fs.existsSync)(CONFIG_FILE)) return JSON.parse((0, import_fs.readFileSync)(CONFIG_FILE, "utf8"));
@@ -8861,11 +8906,14 @@ async function streamResponse(messages, opts = {}) {
     const data = await res.json();
     const text = data.content || "";
     if (text) {
-      process.stdout.write(c.text(text));
+      resetStreamRenderer();
+      streamText(text);
+      _flushWordBuf();
       console.log("");
     }
     return { text, toolUses: [], stopReason: "end_turn" };
   }
+  resetStreamRenderer();
   let fullText = "";
   const blocks = {};
   let stopReason = "end_turn";
@@ -8900,7 +8948,7 @@ async function streamResponse(messages, opts = {}) {
         const d = event.delta || {};
         const textChunk = d.text || (d.type === "text_delta" ? d.text : null);
         if (textChunk) {
-          process.stdout.write(c.text(textChunk));
+          streamText(textChunk);
           fullText += textChunk;
           if (blocks[i] && blocks[i].type === "text") blocks[i].text += textChunk;
         }
@@ -9871,8 +9919,10 @@ ${userContent}`;
   }
   addMessage("user", userContent);
   console.log("");
-  console.log(c.brand("  CORTEX") + c.dim(" >"));
+  console.log(c.youLabel("  YOU") + c.dim(" \u203A ") + c.youText(input));
   console.log("");
+  console.log(c.brand("  CORTEX") + c.dim(" \u203A"));
+  console.log(STREAM_INDENT);
   try {
     let finalText;
     if (isAgentModeOn()) {
@@ -9880,6 +9930,7 @@ ${userContent}`;
     } else {
       const result = await streamResponse(conversationMessages);
       finalText = result.text;
+      _flushWordBuf();
       addMessage("assistant", finalText);
     }
     console.log("");
@@ -9934,7 +9985,7 @@ async function interactiveMode() {
   const rl = import_readline.default.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: c.brand("  * ") + c.accent("CORTEX") + c.brand(" > ")
+    prompt: c.youLabel("  YOU") + c.dim(" \u203A ")
   });
   console.log(c.dim('  Type a command or question. "help" for commands. "exit" to quit.'));
   console.log("");
