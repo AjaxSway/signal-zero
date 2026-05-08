@@ -26,7 +26,7 @@ const CONFIG_DIR = path.join(HOME, '.cortex-signal-zero');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const HISTORY_FILE = path.join(CONFIG_DIR, 'history.json');
 const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 
 // CORTEX API — routes through cortexnode.ai (control server proxy)
 const CORTEX_API_URL = process.env.CORTEX_API_URL || 'https://api.cortexnode.ai';

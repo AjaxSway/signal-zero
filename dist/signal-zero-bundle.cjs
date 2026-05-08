@@ -8664,7 +8664,7 @@ var CONFIG_DIR = import_path.default.join(HOME, ".cortex-signal-zero");
 var CONFIG_FILE = import_path.default.join(CONFIG_DIR, "config.json");
 var HISTORY_FILE = import_path.default.join(CONFIG_DIR, "history.json");
 var SESSIONS_DIR = import_path.default.join(CONFIG_DIR, "sessions");
-var VERSION = "0.2.1";
+var VERSION = "0.2.2";
 var CORTEX_API_URL = process.env.CORTEX_API_URL || "https://api.cortexnode.ai";
 var CORTEX_DEV_URL = "http://127.0.0.1:7749";
 if (!(0, import_fs.existsSync)(CONFIG_DIR)) (0, import_fs.mkdirSync)(CONFIG_DIR, { recursive: true });
